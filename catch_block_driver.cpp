@@ -10,36 +10,39 @@
 
 namespace CatchBlock
 {
-// 模型初值来自工程的 C610 示例；电流、速度和位置步长上限留待逐轴填写。
-static constexpr AdrcTuning initial_adrc{
+// 复用工程 C610 示例的 ADRC 模型初值。
+static constexpr AdrcParameters default_adrc{
     40.0f,   // 观测器带宽（Hz）
     9.6f,    // 控制带宽（Hz）
     1.0f,    // 跟踪系数
     6.8e-5f, // 惯量（kg·m²）
     0.18f,   // 力矩常数（N·m/A）
     0.0f,    // 黏性阻尼
+    0.0f,    // 规划转速沿用本轴转速上限
+};
+static constexpr AdrcTuning initial_dji{
     0.0f,    // 电流上限（A）
-    0.0f,    // 电机转速上限（rpm）
-    0.0f,    // 规划转速上限（rpm）
+    0.0f,    // 指令转速上限（rpm）
     0.0f,    // 单步编码增量上限
     0.0f,    // 实测超速阈值，默认采用转速上限
+    default_adrc,
 };
+static constexpr PosVelTuning initial_pos_vel{0.0f, 0.0f};
+
 volatile Tuning tuning{
-    initial_adrc, // 左升降
-    initial_adrc, // 左开合
-    initial_adrc, // 左输送
-    initial_adrc, // 右升降
-    initial_adrc, // 右开合
-    initial_adrc, // 右输送
-    {},           // 左俯仰
-    {},           // 右俯仰
+    initial_dji,              // 左右升降
+    initial_dji,              // 左右开合
+    initial_dji,              // 左右输送
+    initial_pos_vel,          // 左右俯仰
+    {1, 1, 1, 1, 1, 1, 1, 1}, // 各轴先沿用原始方向
+    {},                       // 左俯仰限位
+    {},                       // 右俯仰限位
 };
 FeedbackSet feedback{};
 
 namespace
 {
-constexpr uint32_t dji_watchdog_ms = 50;
-constexpr uint32_t pitch_watchdog_ms = 50;
+constexpr uint32_t axis_watchdog_ms = 50;
 constexpr uint32_t idle_probe_ms = 50;
 
 enum class Side
@@ -124,12 +127,6 @@ bool InRange(float value, float minimum, float maximum)
   return IsFinite(value) && value >= minimum && value <= maximum;
 }
 
-struct FrameSample
-{
-  uint32_t count;
-  bool usable;
-};
-
 // 每个实例管理一根轴的状态和反馈时效，具体电机负责测量及输出。
 class AxisController
 {
@@ -152,7 +149,7 @@ public:
     {
       return Result::RegistrationFailed;
     }
-    if (seen_frame_ && now_ms - last_frame_ms_ >= feedback_timeout_ms_)
+    if (seen_frame_ && now_ms - last_frame_ms_ >= axis_watchdog_ms)
     {
       status_.fresh = false;
     }
@@ -204,7 +201,7 @@ public:
     }
 
     const bool running = status_.state == State::Active || status_.state == State::Enabling;
-    const bool expired = now_ms - last_frame_ms_ >= feedback_timeout_ms_;
+    const bool expired = now_ms - last_frame_ms_ >= axis_watchdog_ms;
     RefreshFeedback(now_ms);
     if (LatchOutputFault())
     {
@@ -219,16 +216,21 @@ public:
   }
 
 protected:
-  AxisController(Side side, Feedback &status, uint32_t feedback_timeout_ms)
+  AxisController(Side side, const volatile int32_t &staged_direction, Feedback &status)
     : side_(side),
-      status_(status),
-      feedback_timeout_ms_(feedback_timeout_ms)
+      staged_direction_(staged_direction),
+      status_(status)
   {
   }
 
   Feedback &Status()
   {
     return status_;
+  }
+
+  int32_t DirectionSign() const
+  {
+    return direction_sign_;
   }
 
   /**
@@ -249,7 +251,7 @@ private:
   virtual void DisableMotor() = 0;
   virtual void Hold() = 0;
   virtual Result Move(Command command, Target target) = 0;
-  virtual FrameSample ReadSample(bool seen_frame) = 0;
+  virtual bool ReadFeedback(bool seen_frame) = 0;
   virtual void ServiceMotor(uint32_t)
   {
   }
@@ -257,10 +259,7 @@ private:
   {
     return Fault::None;
   }
-  virtual bool CanAcknowledge(const Feedback &)
-  {
-    return true;
-  }
+  virtual bool CanAcknowledge() = 0;
 
   bool LatchOutputFault()
   {
@@ -306,10 +305,18 @@ private:
     {
       return Result::WrongState;
     }
+    const int32_t direction_sign = staged_direction_;
+    if (direction_sign != 1 && direction_sign != -1)
+    {
+      return Result::InvalidTuning;
+    }
     const Result result = ApplyTuning();
     if (result == Result::Ok)
     {
+      direction_sign_ = direction_sign;
       status_.configured = true;
+      // 立即按本次应用的方向刷新反馈坐标。
+      RefreshFeedback(HAL_GetTick());
     }
     return result;
   }
@@ -375,7 +382,7 @@ private:
     {
       return Result::NoFeedback;
     }
-    if (!CanAcknowledge(status_))
+    if (!CanAcknowledge())
     {
       return Result::DeviceFault;
     }
@@ -391,31 +398,32 @@ private:
    */
   void RefreshFeedback(uint32_t now_ms)
   {
-    FrameSample sample;
+    const uint32_t previous_frames = status_.frames;
+    bool usable;
     {
       InterruptGuard guard;
-      sample = ReadSample(seen_frame_);
+      usable = ReadFeedback(seen_frame_);
     }
 
-    if (now_ms - last_poll_ms_ >= feedback_timeout_ms_)
+    if (now_ms - last_poll_ms_ >= axis_watchdog_ms)
     {
       // 调度间隔过长，积存帧的接收时刻未知。
       seen_frame_ = false;
     }
-    else if (sample.usable && status_.frames != sample.count)
+    else if (usable && status_.frames != previous_frames)
     {
       seen_frame_ = true;
       last_frame_ms_ = now_ms;
     }
     last_poll_ms_ = now_ms;
-    status_.frames = sample.count;
     status_.age_ms = seen_frame_ ? now_ms - last_frame_ms_ : UINT32_MAX;
-    status_.fresh = seen_frame_ && status_.age_ms < feedback_timeout_ms_;
+    status_.fresh = seen_frame_ && status_.age_ms < axis_watchdog_ms;
   }
 
   const Side side_;
+  const volatile int32_t &staged_direction_;
   Feedback &status_;
-  const uint32_t feedback_timeout_ms_;
+  int32_t direction_sign_ = 1;
   uint32_t last_frame_ms_ = 0;
   uint32_t last_poll_ms_ = 0;
   bool seen_frame_ = false;
@@ -424,8 +432,9 @@ private:
 class DjiAxis final : public AxisController
 {
 public:
-  DjiAxis(Side side, uint8_t id, MotorDJIMode mode, volatile AdrcTuning &staged, Feedback &status)
-    : AxisController(side, status, dji_watchdog_ms),
+  DjiAxis(Side side, uint8_t id, MotorDJIMode mode, const volatile AdrcTuning &staged,
+          const volatile int32_t &direction, Feedback &status)
+    : AxisController(side, direction, status),
       id_(id),
       mode_(mode),
       staged_(staged)
@@ -488,11 +497,11 @@ private:
    */
   Fault CheckOutput(uint32_t now_ms) const
   {
-    if (!has_feedback_ || now_ms - last_feedback_ms_ >= dji_watchdog_ms)
+    if (!has_feedback_ || now_ms - last_feedback_ms_ >= axis_watchdog_ms)
     {
       return Fault::FeedbackTimeout;
     }
-    if (now_ms - last_control_ms_ >= dji_watchdog_ms)
+    if (now_ms - last_control_ms_ >= axis_watchdog_ms)
     {
       return Fault::CommandTimeout;
     }
@@ -527,10 +536,10 @@ private:
     return output_fault_;
   }
 
-  bool CanAcknowledge(const Feedback &) override
+  bool CanAcknowledge() override
   {
     InterruptGuard guard;
-    if (!has_feedback_ || HAL_GetTick() - last_feedback_ms_ >= dji_watchdog_ms || IsOverspeed())
+    if (!has_feedback_ || HAL_GetTick() - last_feedback_ms_ >= axis_watchdog_ms || IsOverspeed())
     {
       return false;
     }
@@ -553,19 +562,20 @@ private:
 
   bool ValidTuning(const AdrcTuning &params) const
   {
-    const bool model_valid = IsPositive(params.wo_hz) &&
-        IsPositive(params.wc_hz) &&
-        IsPositive(params.tracking_coeff) &&
-        IsPositive(params.inertia_kg_m2) &&
-        IsPositive(params.kt_nm_per_a) &&
-        IsFinite(params.damping) && params.damping >= 0.0f;
+    const AdrcParameters &adrc = params.adrc;
+    const bool model_valid = IsPositive(adrc.wo_hz) &&
+        IsPositive(adrc.wc_hz) &&
+        IsPositive(adrc.tracking_coeff) &&
+        IsPositive(adrc.inertia_kg_m2) &&
+        IsPositive(adrc.kt_nm_per_a) &&
+        IsFinite(adrc.damping) && adrc.damping >= 0.0f;
     const bool limits_valid = IsPositive(params.current_limit_a) && params.current_limit_a <= 10.0f &&
         IsPositive(params.speed_limit_rpm) &&
-        IsPositive(params.planned_speed_rpm) &&
-        params.planned_speed_rpm <= params.speed_limit_rpm;
+        InRange(adrc.planned_speed_rpm, 0.0f, params.speed_limit_rpm);
     const bool overspeed_valid = params.overspeed_trip_rpm == 0.0f ||
         (IsFinite(params.overspeed_trip_rpm) && params.overspeed_trip_rpm >= params.speed_limit_rpm);
-    return model_valid && limits_valid && overspeed_valid && (mode_ != PosC || IsPositive(params.max_step_code));
+    return model_valid && limits_valid && overspeed_valid &&
+        (mode_ != PosC || IsPositive(params.max_step_code));
   }
 
   /**
@@ -593,12 +603,14 @@ private:
     {
       motor_.AsSpeedC();
     }
-    motor_.ADRC_Womega(params.wo_hz, params.wc_hz)
-        .ADRC_SOTF(params.tracking_coeff)
-        .ADRC_Physic(params.inertia_kg_m2, params.kt_nm_per_a, params.damping)
+    const AdrcParameters &adrc = params.adrc;
+    const float planned_rpm = adrc.planned_speed_rpm > 0.0f ? adrc.planned_speed_rpm : params.speed_limit_rpm;
+    motor_.ADRC_Womega(adrc.wo_hz, adrc.wc_hz)
+        .ADRC_SOTF(adrc.tracking_coeff)
+        .ADRC_Physic(adrc.inertia_kg_m2, adrc.kt_nm_per_a, adrc.damping)
         .CurLimit(params.current_limit_a)
         .SpdLimit(params.speed_limit_rpm)
-        .ADRC_MaxPlannedVel(params.planned_speed_rpm)
+        .ADRC_MaxPlannedVel(planned_rpm)
         .Apply();
     motor_.Neutral();
 
@@ -618,7 +630,7 @@ private:
   {
     InterruptGuard guard;
     const uint32_t now_ms = HAL_GetTick();
-    if (!has_feedback_ || now_ms - last_feedback_ms_ >= dji_watchdog_ms)
+    if (!has_feedback_ || now_ms - last_feedback_ms_ >= axis_watchdog_ms)
     {
       return Result::NoFeedback;
     }
@@ -660,7 +672,7 @@ private:
     motor_.motor_adrc.i_ff_ext = 0.0f;
     if (mode_ == PosC)
     {
-      Status().commanded.position = motor_.targ_pos;
+      Status().commanded.position = DirectionSign() * motor_.targ_pos;
     }
   }
 
@@ -674,7 +686,7 @@ private:
       }
 
       InterruptGuard guard;
-      motor_.SetSpd(target.velocity);
+      motor_.SetSpd(DirectionSign() * target.velocity);
       Status().commanded = {0, target.velocity};
       return Result::Ok;
     }
@@ -689,34 +701,36 @@ private:
     }
 
     const double goal_code = static_cast<double>(Status().position_code) + target.position;
-    if (goal_code < INT32_MIN || goal_code > INT32_MAX)
+    const double motor_goal_code = DirectionSign() * goal_code;
+    if (motor_goal_code < INT32_MIN || motor_goal_code > INT32_MAX)
     {
       return Result::InvalidTarget;
     }
 
     InterruptGuard guard;
-    motor_.SetPos(static_cast<float>(goal_code));
-    Status().commanded = {motor_.targ_pos, 0};
+    motor_.SetPos(static_cast<float>(motor_goal_code));
+    Status().commanded = {DirectionSign() * motor_.targ_pos, 0};
     return Result::Ok;
   }
 
-  FrameSample ReadSample(bool seen_frame) override
+  bool ReadFeedback(bool seen_frame) override
   {
     const auto &measurement = motor_.driver.measure;
     Feedback &status = Status();
-    status.position_code = measurement.total_angle;
-    status.speed_rpm = measurement.speed_rpm;
+    status.frames = measurement.msg_cnt;
+    status.position_code = static_cast<int64_t>(measurement.total_angle) * DirectionSign();
+    status.speed_rpm = measurement.speed_rpm * DirectionSign();
     status.current_a = measurement.raw_current * 0.001f;
     status.device_enabled = motor_.driver.enabled;
 
     // C610 的前 51 帧只更新偏置，第 52 帧开始解码运动数据。
-    return {measurement.msg_cnt, measurement.msg_cnt >= 52 || seen_frame};
+    return status.frames >= 52 || seen_frame;
   }
 
   const uint8_t id_;
   const MotorDJIMode mode_;
-  volatile AdrcTuning &staged_;
-  AdrcTuning applied_{};
+  const volatile AdrcTuning &staged_;
+  AdrcTuning applied_ = initial_dji;
   MotorDJI motor_;
   volatile bool controller_ready_ = false;
   volatile bool has_feedback_ = false;
@@ -729,11 +743,13 @@ private:
 class PitchAxis final : public AxisController
 {
 public:
-  PitchAxis(Side side, uint8_t id, uint8_t feedback_id, volatile PosVelTuning &staged, Feedback &status)
-    : AxisController(side, status, pitch_watchdog_ms),
+  PitchAxis(Side side, uint8_t id, uint8_t feedback_id, const volatile PosVelTuning &staged,
+            const volatile PitchLimits &staged_limits, const volatile int32_t &direction, Feedback &status)
+    : AxisController(side, direction, status),
       id_(id),
       feedback_id_(feedback_id),
-      staged_(staged)
+      staged_(staged),
+      staged_limits_(staged_limits)
   {
   }
 
@@ -751,13 +767,13 @@ private:
     return registered;
   }
 
-  bool ValidTuning(const PosVelTuning &params) const
+  bool ValidTuning(const PosVelTuning &params, const PitchLimits &limits) const
   {
     const float pmax = motor_.driver._pmax;
     const float vmax = motor_.driver._vmax;
-    const bool angles_valid = InRange(params.min_angle_rad, -pmax, pmax) &&
-        InRange(params.max_angle_rad, -pmax, pmax) &&
-        params.min_angle_rad < params.max_angle_rad;
+    const bool angles_valid = InRange(limits.min_angle_rad, -pmax, pmax) &&
+        InRange(limits.max_angle_rad, -pmax, pmax) &&
+        limits.min_angle_rad < limits.max_angle_rad;
     const bool limits_valid = IsPositive(params.velocity_command_limit_rad_s) &&
         params.velocity_command_limit_rad_s <= params.overspeed_trip_rad_s &&
         params.overspeed_trip_rad_s < vmax;
@@ -767,24 +783,27 @@ private:
   Result ApplyTuning() override
   {
     const PosVelTuning params = ReadStaged(staged_);
-    if (!ValidTuning(params))
+    const PitchLimits limits = ReadStaged(staged_limits_);
+    if (!ValidTuning(params, limits))
     {
       return Result::InvalidTuning;
     }
-    motor_.SetPosLimit(params.max_angle_rad, params.min_angle_rad);
+    motor_.SetPosLimit(limits.max_angle_rad, limits.min_angle_rad);
     motor_.SetVelLimit(params.velocity_command_limit_rad_s);
     applied_ = params;
+    angle_limits_ = limits;
     return Result::Ok;
   }
 
-  bool CanAcknowledge(const Feedback &status) override
+  bool CanAcknowledge() override
   {
-    return status.device_error == DM_ERR_DISABLED;
+    return Status().device_error == DM_ERR_DISABLED;
   }
 
   bool PositionInRange(float angle_rad) const
   {
-    return InRange(angle_rad, applied_.min_angle_rad, applied_.max_angle_rad);
+    const float motor_angle_rad = DirectionSign() * angle_rad;
+    return InRange(motor_angle_rad, angle_limits_.min_angle_rad, angle_limits_.max_angle_rad);
   }
 
   /**
@@ -808,7 +827,7 @@ private:
     enable_ms_ = now_ms;
     status.state = State::Enabling;
     // SetPosVel 会把零速改成 0.1。预置须原样发送零速。
-    motor_.driver.SendPosVel(status.commanded.position, 0.0f);
+    motor_.driver.SendPosVel(DirectionSign() * status.commanded.position, 0.0f);
     return Result::Ok;
   }
 
@@ -843,16 +862,17 @@ private:
     return Result::Ok;
   }
 
-  FrameSample ReadSample(bool) override
+  bool ReadFeedback(bool) override
   {
     const auto &measurement = motor_.driver.measure;
     Feedback &status = Status();
-    status.angle_rad = measurement.msg_cnt ? motor_.GetAngle() : 0.0f;
-    status.velocity_rad_s = measurement.vel_rad;
+    status.frames = measurement.msg_cnt;
+    status.angle_rad = status.frames ? DirectionSign() * motor_.GetAngle() : 0.0f;
+    status.velocity_rad_s = DirectionSign() * measurement.vel_rad;
     status.torque_nm = measurement.torq_nm;
     status.device_error = measurement.err_code;
     status.device_enabled = motor_.IsEnabled();
-    return {measurement.msg_cnt, probing_};
+    return probing_;
   }
 
   /**
@@ -862,7 +882,7 @@ private:
   void SendActiveTarget(uint32_t now_ms)
   {
     const Feedback &status = Status();
-    if (now_ms - last_command_ms_ >= pitch_watchdog_ms)
+    if (now_ms - last_command_ms_ >= axis_watchdog_ms)
     {
       Trip(Fault::CommandTimeout);
       return;
@@ -885,7 +905,7 @@ private:
 
     const Target &target = status.commanded;
     last_command_ms_ = now_ms;
-    motor_.SetPosVel(target.position, target.velocity);
+    motor_.SetPosVel(DirectionSign() * target.position, target.velocity);
   }
 
   /**
@@ -895,7 +915,7 @@ private:
   void AdvanceEnable(uint32_t now_ms)
   {
     Feedback &status = Status();
-    if (now_ms - enable_ms_ >= pitch_watchdog_ms)
+    if (now_ms - enable_ms_ >= axis_watchdog_ms)
     {
       Trip(Fault::EnableTimeout);
       return;
@@ -966,8 +986,10 @@ private:
 
   const uint8_t id_;
   const uint8_t feedback_id_;
-  volatile PosVelTuning &staged_;
-  PosVelTuning applied_{};
+  const volatile PosVelTuning &staged_;
+  const volatile PitchLimits &staged_limits_;
+  PosVelTuning applied_ = initial_pos_vel;
+  PitchLimits angle_limits_{};
   MotorDM motor_;
   uint32_t enable_ms_ = 0;
   uint32_t handshake_frames_ = 0;
@@ -978,14 +1000,16 @@ private:
 };
 
 // 按机械位置绑定设备、候选参数和反馈。对象与驱动回调同寿命。
-DjiAxis left_lift{Side::Left, 1, PosC, tuning.left_lift, feedback.left_lift};
-DjiAxis left_clamp{Side::Left, 2, PosC, tuning.left_clamp, feedback.left_clamp};
-DjiAxis left_feed{Side::Left, 3, SpeedC, tuning.left_feed, feedback.left_feed};
-DjiAxis right_lift{Side::Right, 1, PosC, tuning.right_lift, feedback.right_lift};
-DjiAxis right_clamp{Side::Right, 2, PosC, tuning.right_clamp, feedback.right_clamp};
-DjiAxis right_feed{Side::Right, 3, SpeedC, tuning.right_feed, feedback.right_feed};
-PitchAxis left_pitch{Side::Left, 0x07, 0x17, tuning.left_pitch, feedback.left_pitch};
-PitchAxis right_pitch{Side::Right, 0x08, 0x18, tuning.right_pitch, feedback.right_pitch};
+DjiAxis left_lift{Side::Left, 1, PosC, tuning.lift, tuning.directions.left_lift, feedback.left_lift};
+DjiAxis left_clamp{Side::Left, 2, PosC, tuning.clamp, tuning.directions.left_clamp, feedback.left_clamp};
+DjiAxis left_feed{Side::Left, 3, SpeedC, tuning.feed, tuning.directions.left_feed, feedback.left_feed};
+DjiAxis right_lift{Side::Right, 1, PosC, tuning.lift, tuning.directions.right_lift, feedback.right_lift};
+DjiAxis right_clamp{Side::Right, 2, PosC, tuning.clamp, tuning.directions.right_clamp, feedback.right_clamp};
+DjiAxis right_feed{Side::Right, 3, SpeedC, tuning.feed, tuning.directions.right_feed, feedback.right_feed};
+PitchAxis left_pitch{Side::Left, 0x07, 0x17, tuning.pitch, tuning.left_pitch_limits,
+                    tuning.directions.left_pitch, feedback.left_pitch};
+PitchAxis right_pitch{Side::Right, 0x08, 0x18, tuning.pitch, tuning.right_pitch_limits,
+                     tuning.directions.right_pitch, feedback.right_pitch};
 
 // 顺序与 Axis 的 Watch 轴号一致。
 AxisController *const axes[] = {
@@ -1020,14 +1044,14 @@ void Update()
   }
 }
 
-Result Execute(Axis axis, Command command, const Target &target, uint32_t now_ms)
+Result Execute(Axis axis, Command command, const Target &target)
 {
   const uint32_t index = static_cast<uint32_t>(axis);
   if (index >= sizeof(axes) / sizeof(axes[0]))
   {
     return Result::InvalidAxis;
   }
-  return axes[index]->Execute(command, target, now_ms);
+  return axes[index]->Execute(command, target, HAL_GetTick());
 }
 }
 }

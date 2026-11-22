@@ -1,5 +1,4 @@
 #include "catch_block.hpp"
-#include "bsp_halport.hpp"
 
 namespace CatchBlock
 {
@@ -32,7 +31,7 @@ void Controller::RunCycle()
   }
 
   last_submit_ = sequence;
-  debug.result = Driver::Execute(axis, command, target, HAL_GetTick());
+  debug.result = Driver::Execute(axis, command, target);
   debug.processed = sequence;
 }
 }
